@@ -84,6 +84,139 @@ class TestRegistration:
         assert registered == ["delete_transaction"]
 
 
+class TestWriteAllowlist:
+    """MONARCH_MCP_WRITE_ALLOW re-exposes a curated subset of writes while read
+    only is on, and fails closed in every ambiguous direction."""
+
+    @staticmethod
+    def _install_with(monkeypatch, read_only_value, allow_value):
+        registered = []
+
+        class FakeMCP:
+            def tool(self, *args, **kwargs):
+                def decorator(fn):
+                    registered.append(args[0] if args and isinstance(args[0], str) else fn.__name__)
+                    return fn
+
+                return decorator
+
+        if read_only_value is None:
+            monkeypatch.delenv(read_only.ENV_VAR, raising=False)
+        else:
+            monkeypatch.setenv(read_only.ENV_VAR, read_only_value)
+        if allow_value is None:
+            monkeypatch.delenv(read_only.WRITE_ALLOW_ENV_VAR, raising=False)
+        else:
+            monkeypatch.setenv(read_only.WRITE_ALLOW_ENV_VAR, allow_value)
+
+        fake = FakeMCP()
+        read_only.install(fake)
+        return fake, registered
+
+    def test_allowlisted_write_is_re_exposed(self, monkeypatch):
+        fake, registered = self._install_with(
+            monkeypatch, "1", "create_transaction_rule,bulk_categorize_transactions"
+        )
+
+        def create_transaction_rule():
+            pass
+
+        def bulk_categorize_transactions():
+            pass
+
+        def update_merchant():  # a mutating tool NOT on the allowlist
+            pass
+
+        def get_accounts():
+            pass
+
+        fake.tool()(create_transaction_rule)
+        fake.tool()(bulk_categorize_transactions)
+        fake.tool()(update_merchant)
+        fake.tool()(get_accounts)
+
+        assert "create_transaction_rule" in registered
+        assert "bulk_categorize_transactions" in registered
+        assert "update_merchant" not in registered  # still gated
+        assert "get_accounts" in registered
+
+    def test_never_allowlistable_cannot_be_re_exposed(self, monkeypatch):
+        """Even named explicitly, session/destructive/account tools stay hidden."""
+        fake, registered = self._install_with(
+            monkeypatch, "1", "monarch_logout,delete_transaction,update_account,refresh_accounts"
+        )
+
+        def monarch_logout():
+            pass
+
+        def delete_transaction():
+            pass
+
+        def update_account():
+            pass
+
+        def refresh_accounts():
+            pass
+
+        for fn in (monarch_logout, delete_transaction, update_account, refresh_accounts):
+            fake.tool()(fn)
+
+        assert registered == []  # none re-exposed
+
+    def test_unknown_name_is_ignored(self, monkeypatch):
+        """A typo widens nothing: it is dropped, not honoured."""
+        allow = read_only._write_allowlist
+        monkeypatch.setenv(read_only.ENV_VAR, "1")
+        monkeypatch.setenv(read_only.WRITE_ALLOW_ENV_VAR, "create_transaction_ruel,get_accounts")
+        # neither a real mutating tool: typo'd rule name, and a read tool
+        assert allow() == frozenset()
+
+    def test_allowlist_is_a_noop_when_read_only_off(self, monkeypatch):
+        """With read only off there is no gate to open."""
+        fake, registered = self._install_with(monkeypatch, None, "create_transaction_rule")
+
+        def create_transaction_rule():
+            pass
+
+        def delete_transaction():
+            pass
+
+        # install() returned early, so mcp.tool is unwrapped: everything registers.
+        fake.tool()(create_transaction_rule)
+        fake.tool()(delete_transaction)
+        assert "create_transaction_rule" in registered
+        assert "delete_transaction" in registered
+
+    def test_empty_or_unset_allowlist_hides_all_writes(self, monkeypatch):
+        for value in (None, "", "  ", ","):
+            monkeypatch.setenv(read_only.ENV_VAR, "1")
+            if value is None:
+                monkeypatch.delenv(read_only.WRITE_ALLOW_ENV_VAR, raising=False)
+            else:
+                monkeypatch.setenv(read_only.WRITE_ALLOW_ENV_VAR, value)
+            assert read_only._write_allowlist() == frozenset()
+
+    def test_effective_allowlist_is_subset_of_mutating(self, monkeypatch):
+        monkeypatch.setenv(read_only.ENV_VAR, "1")
+        monkeypatch.setenv(
+            read_only.WRITE_ALLOW_ENV_VAR, "create_transaction_rule,update_merchant"
+        )
+        assert read_only._write_allowlist() <= read_only.MUTATING_TOOLS
+
+
+class TestNeverAllowlistableInvariants:
+    def test_it_is_a_strict_subset_of_mutating_tools(self):
+        """A never-allowlistable name that is not even a mutating tool would be
+        dead config and could never gate a read tool by accident."""
+        assert read_only.NEVER_ALLOWLISTABLE <= read_only.MUTATING_TOOLS
+
+    def test_the_session_and_destructive_tools_are_floored(self):
+        """These must never be reachable via the allowlist."""
+        for name in ("monarch_login", "monarch_login_with_token", "monarch_logout",
+                     "delete_transaction", "delete_transaction_rule"):
+            assert name in read_only.NEVER_ALLOWLISTABLE
+
+
 class TestMutatingToolList:
     async def test_every_named_tool_actually_exists(self):
         """A typo here would silently leave a mutating tool exposed."""
